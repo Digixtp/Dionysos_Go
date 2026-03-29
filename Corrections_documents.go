@@ -1,14 +1,12 @@
 /*
 ==============================================================================
-Titre : Moteur d'Audit et Correction Linguistique Massif (Multi-Formats)
+Titre : Moteur d'Audit Linguistique Massif (Mode Détection)
 Auteur : Digixtp
-Version : 8.1.0 (Prompt Défensif & Monitoring Absolu)
-Note introductive : Ce script orchestre la correction de textes via un LLM local.
-[MÀJ V8.1.0] : Refonte du prompt pour contrer les hallucinations typographiques
-des petits modèles (interdiction de modifier la casse initiale ou les apostrophes).
-Correction de l'algorithme de traçabilité : le fichier de log se génère désormais
-correctement si aucune erreur finale n'est retenue, permettant un audit réel
-du comportement du modèle face aux vraies coquilles (ex: sas -> sans).
+Version : 14.0.0 (Golden Master - Archive)
+Note introductive : Script d'orchestration pour l'audit de textes via Ollama.
+Cette version est sanctuarisée. L'architecture Go (Batching, Diffing, Regex,
+Export Excel RichText) est aboutie. En attente d'un LLM disposant de >7B
+paramètres pour garantir un respect strict du format JSON sans hallucination.
 ==============================================================================
 */
 package main
@@ -16,23 +14,18 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unicode"
 	"unsafe"
 
 	"github.com/xuri/excelize/v2"
@@ -89,25 +82,9 @@ type ErreurDetecteePropre struct {
 	MotCorrige      string
 }
 
-type ActionUnitaire struct {
-	MotFaux    string
-	MotCorrige string
-	LigneExcel int
-}
-
-type RemplacementAgrege struct {
-	Original        string
-	CorrectionFinal string
-	LignesExcel     []int
-}
-
-// --- CLIENT HTTP OPTIMISÉ ---
+// --- CLIENT HTTP ---
 var httpClient = &http.Client{
-	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
-	},
+	Timeout: 300 * time.Second,
 }
 
 var stopRequested int32
@@ -127,35 +104,24 @@ func init() {
 
 // --- UTILITAIRES SYSTÈME ET SÉCURITÉ ---
 func getDesktopPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "."
-	}
+	home, _ := os.UserHomeDir()
 	return filepath.Join(home, "Desktop")
 }
 
 func bypassMaxPath(p string) string {
-	abs, err := filepath.Abs(p)
-	if err != nil {
-		return p
-	}
+	abs, _ := filepath.Abs(p)
 	if !strings.HasPrefix(abs, `\\?\`) {
 		return `\\?\` + abs
 	}
 	return abs
 }
 
-func safeDelete(filePath string) {
+func safeDelete(src string) {
 	trashDir := filepath.Join(getDesktopPath(), "fichier à supprimer")
 	os.MkdirAll(trashDir, 0755)
-
-	base := filepath.Base(filePath)
-	dest := filepath.Join(trashDir, fmt.Sprintf("%d_corrupted_%s", time.Now().Unix(), base))
-
-	err := os.Rename(filePath, dest)
-	if err != nil && !os.IsNotExist(err) {
-		fmt.Printf("\n%s[Avertissement] Impossible de sécuriser le fichier : %v%s\n", ColorYellow, err, ColorReset)
-	}
+	ts := time.Now().Format("20060102_150405")
+	dest := filepath.Join(trashDir, ts+"_"+filepath.Base(src))
+	os.Rename(src, dest)
 }
 
 func purgerMemoireAutomatique() {
@@ -169,72 +135,22 @@ func loadState(path string) StateDB {
 	db := StateDB{Processed: make(map[string]bool)}
 	data, err := os.ReadFile(bypassMaxPath(path))
 	if err == nil {
-		errUnmarshall := json.Unmarshal(data, &db)
-		if errUnmarshall != nil {
-			fmt.Println(ColorRed + "[Alerte] Fichier d'état corrompu. Sécurisation..." + ColorReset)
-			safeDelete(bypassMaxPath(path))
-			return StateDB{Processed: make(map[string]bool)}
-		}
+		json.Unmarshal(data, &db)
 	}
 	return db
 }
 
 func saveState(path string, db StateDB) {
-	data, err := json.MarshalIndent(db, "", "  ")
-	if err == nil {
-		os.WriteFile(bypassMaxPath(path), data, 0644)
-	}
+	data, _ := json.MarshalIndent(db, "", "  ")
+	os.WriteFile(bypassMaxPath(path), data, 0644)
 }
 
-func logDebugLLM(raw string, parseErr string) {
-	logPath := filepath.Join(getDesktopPath(), "LLM_Debug_Crash.log")
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err == nil {
-		defer f.Close()
-		timestamp := time.Now().Format("2006-01-02 15:04:05")
-		f.WriteString(fmt.Sprintf("\n[%s] === ERREUR PARSING JSON ===\n", timestamp))
-		f.WriteString("Erreur Go : " + parseErr + "\n")
-		f.WriteString("Réponse LLM Brute :\n" + raw + "\n===========================\n")
-	}
-}
-
-func logTraceZeroFaute(texteSoumis string, reponseLLM string) {
+func logTraceZeroFaute(lot string, resp string) {
 	logPath := filepath.Join(getDesktopPath(), "LLM_Trace_Zero_Faute.log")
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err == nil {
 		defer f.Close()
-		timestamp := time.Now().Format("2006-01-02 15:04:05")
-		f.WriteString(fmt.Sprintf("\n[%s] === TRACE D'ANALYSE (0 Faute Retenue) ===\n", timestamp))
-		f.WriteString("--- TEXTE SOUMIS AU LLM ---\n" + texteSoumis + "\n")
-		f.WriteString("--- RÉPONSE BRUTE DU LLM ---\n" + reponseLLM + "\n===========================\n")
-	}
-}
-
-func verifierVerrouFichier(chemin string) error {
-	file, err := os.OpenFile(bypassMaxPath(chemin), os.O_RDWR, 0666)
-	if err != nil {
-		return fmt.Errorf("fichier verrouillé par une autre application")
-	}
-	file.Close()
-	return nil
-}
-
-func attendreDisqueOptimal(seuilMax int) {
-	psScript := `(Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'").PercentDiskTime`
-	for {
-		cmd := exec.Command("powershell", "-NoProfile", "-Command", psScript)
-		out, err := cmd.Output()
-		if err != nil {
-			return
-		}
-		valStr := strings.TrimSpace(string(out))
-		valInt, errConv := strconv.Atoi(valStr)
-		if errConv != nil || valInt <= seuilMax {
-			fmt.Print("\r\033[K")
-			return
-		}
-		fmt.Printf("\r%s[Throttling] Disque saturé (%d%%). Temporisation RAM...%s", ColorYellow, valInt, ColorReset)
-		time.Sleep(2 * time.Second)
+		f.WriteString(fmt.Sprintf("\n[%s] --- ANALYSE LOT ---\nLot: %s\nReponse:\n%s\n", time.Now().Format("15:04:05"), lot, resp))
 	}
 }
 
@@ -259,47 +175,207 @@ func parseFlexString(val interface{}) string {
 	switch v := val.(type) {
 	case string:
 		return v
-	case []interface{}:
-		var strs []string
-		for _, s := range v {
-			if strVal, ok := s.(string); ok {
-				strs = append(strs, strVal)
-			} else {
-				strs = append(strs, fmt.Sprintf("%v", s))
-			}
-		}
-		return strings.Join(strs, ", ")
 	default:
 		return fmt.Sprintf("%v", v)
 	}
 }
 
-func estTexteValidePourCorrection(texte string) bool {
-	t := strings.TrimSpace(texte)
-	if len(t) < 3 {
-		return false
+// --- MOTEUR DE DIFFING ---
+func findExactDiff(orig, corr string) (string, string) {
+	origR := []rune(orig)
+	corrR := []rune(corr)
+
+	start := 0
+	minLen := len(origR)
+	if len(corrR) < minLen {
+		minLen = len(corrR)
 	}
-	lettres := 0
-	for _, r := range t {
-		if unicode.IsLetter(r) {
-			lettres++
+
+	for start < minLen && origR[start] == corrR[start] {
+		start++
+	}
+
+	for start > 0 && origR[start-1] != ' ' && origR[start-1] != '\'' && origR[start-1] != '-' {
+		start--
+	}
+
+	endOrig := len(origR)
+	endCorr := len(corrR)
+
+	for endOrig > start && endCorr > start && origR[endOrig-1] == corrR[endCorr-1] {
+		endOrig--
+		endCorr--
+	}
+
+	for endOrig < len(origR) && origR[endOrig] != ' ' && origR[endOrig] != '.' && origR[endOrig] != ',' && origR[endOrig] != ';' && origR[endOrig] != ':' {
+		endOrig++
+	}
+	for endCorr < len(corrR) && corrR[endCorr] != ' ' && corrR[endCorr] != '.' && corrR[endCorr] != ',' && corrR[endCorr] != ';' && corrR[endCorr] != ':' {
+		endCorr++
+	}
+
+	if start >= endOrig || start >= endCorr {
+		return orig, corr
+	}
+
+	return strings.TrimSpace(string(origR[start:endOrig])), strings.TrimSpace(string(corrR[start:endCorr]))
+}
+
+// --- COLORISATION RICH TEXT ---
+func getRichTextRuns(phrase string, targetWord string, colorHex string) []excelize.RichTextRun {
+	if targetWord == "" || phrase == "" {
+		return []excelize.RichTextRun{{Text: phrase}}
+	}
+
+	re, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(targetWord))
+	if err != nil {
+		return []excelize.RichTextRun{{Text: phrase}}
+	}
+
+	locs := re.FindAllStringIndex(phrase, -1)
+	if len(locs) == 0 {
+		return []excelize.RichTextRun{{Text: phrase}}
+	}
+
+	var runs []excelize.RichTextRun
+	lastIdx := 0
+
+	for _, loc := range locs {
+		if loc[0] > lastIdx {
+			runs = append(runs, excelize.RichTextRun{Text: phrase[lastIdx:loc[0]]})
+		}
+		actualWord := phrase[loc[0]:loc[1]]
+		runs = append(runs, excelize.RichTextRun{
+			Text: actualWord,
+			Font: &excelize.Font{Color: colorHex, Bold: true},
+		})
+		lastIdx = loc[1]
+	}
+	if lastIdx < len(phrase) {
+		runs = append(runs, excelize.RichTextRun{Text: phrase[lastIdx:]})
+	}
+	return runs
+}
+
+// --- MOTEUR OLLAMA ---
+func validerPreRequisLLM() error {
+	client := http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://localhost:11434/api/tags")
+	if err != nil {
+		return fmt.Errorf("Ollama injoignable. Le service doit être démarré")
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+func interrogerLLM_Detection(phrases []string) []ErreurDetecteePropre {
+	if len(phrases) == 0 {
+		return nil
+	}
+
+	lotJSON, _ := json.Marshal(phrases)
+	url := "http://localhost:11434/api/generate"
+
+	prompt := fmt.Sprintf(`Analyse ces phrases et trouve UNIQUEMENT les fautes d'orthographe ou de grammaire.
+RÈGLES D'OR ABSOLUES :
+1. INTERDICTION D'UTILISER DES SYNONYMES. 
+2. Si une phrase est correcte, ignore-la.
+3. Tu DOIS renvoyer un objet JSON contenant un unique tableau nommé "corrections".
+
+FORMAT EXACT EXIGÉ :
+{
+  "corrections": [
+    {
+      "phrase": "la phrase entière avec sa faute",
+      "faux": "le mot erroné exact",
+      "corrige": "la correction orthographique"
+    }
+  ]
+}
+
+PHRASES À TRAITER : 
+%s`, string(lotJSON))
+
+	reqBody := LLMRequest{
+		Model: "qwen2.5:1.5b", Prompt: prompt, Stream: false, Format: "json",
+		Options: LLMOption{Temperature: 0.0, RepeatPenalty: 1.0, NumCtx: 4096, NumPredict: 2048},
+	}
+
+	jsonData, _ := json.Marshal(reqBody)
+	resp, err := httpClient.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var llmResp LLMResponse
+	json.NewDecoder(resp.Body).Decode(&llmResp)
+
+	raw := strings.TrimSpace(llmResp.Response)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+
+	var parsedData map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &parsedData); err != nil {
+		return nil
+	}
+
+	rawCorrections, ok := parsedData["corrections"].([]interface{})
+	if !ok {
+		return nil
+	}
+
+	var results []ErreurDetecteePropre
+
+	for _, item := range rawCorrections {
+		obj, isMap := item.(map[string]interface{})
+		if !isMap {
+			continue
+		}
+
+		p := parseFlexString(obj["phrase"])
+		f := parseFlexString(obj["faux"])
+		c := parseFlexString(obj["corrige"])
+
+		if f == "" || c == "" || p == "" {
+			continue
+		}
+		if strings.EqualFold(f, c) {
+			continue
+		}
+		if len(c) > len(f)*3 || len(f) > len(c)*3 {
+			continue
+		}
+
+		phraseTrouvee := ""
+		for _, phraseSource := range phrases {
+			if strings.Contains(strings.ToLower(phraseSource), strings.ToLower(f)) || strings.Contains(phraseSource, p) {
+				phraseTrouvee = phraseSource
+				break
+			}
+		}
+
+		if phraseTrouvee != "" {
+			results = append(results, ErreurDetecteePropre{PhraseOriginale: phraseTrouvee, MotFaux: f, MotCorrige: c})
 		}
 	}
-	if lettres < 2 {
-		return false
+
+	if len(results) == 0 {
+		logTraceZeroFaute(string(lotJSON), raw)
 	}
-	return true
+	return results
 }
 
 // --- PARSING FICHIERS OCR ---
 func parserFichierOCR(ocrPath string) ([]BlockMajeur, error) {
 	bytesData, err := os.ReadFile(bypassMaxPath(ocrPath))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("lecture impossible")
 	}
 	contenu := string(bytesData)
-
 	cheminNatif := ""
+
 	lignes := strings.Split(contenu, "\n")
 	for _, ligne := range lignes {
 		if strings.HasPrefix(ligne, "Chemin_complet__") {
@@ -310,7 +386,7 @@ func parserFichierOCR(ocrPath string) ([]BlockMajeur, error) {
 	}
 
 	if cheminNatif == "" {
-		return nil, fmt.Errorf("chemin natif introuvable")
+		return nil, fmt.Errorf("balise 'Chemin_complet__' introuvable")
 	}
 
 	debIdx := strings.Index(contenu, "__début_du_corpus___")
@@ -326,7 +402,6 @@ func parserFichierOCR(ocrPath string) ([]BlockMajeur, error) {
 	var blocs []BlockMajeur
 	indexBloc := 0
 	blocCourant := BlockMajeur{Chemin: cheminNatif, Index: indexBloc}
-	var charCount int
 
 	for _, ligne := range lignesCorpus {
 		ligne = strings.TrimSpace(ligne)
@@ -343,18 +418,15 @@ func parserFichierOCR(ocrPath string) ([]BlockMajeur, error) {
 			textPur = strings.TrimSpace(matches[2])
 		}
 
-		if estTexteValidePourCorrection(textPur) {
-			if charCount+len(textPur) > 1000 && len(blocCourant.Lignes) > 0 {
+		if len(textPur) > 4 && strings.ContainsAny(textPur, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+			if len(blocCourant.Lignes) >= 6 {
 				blocs = append(blocs, blocCourant)
 				indexBloc++
 				blocCourant = BlockMajeur{Chemin: cheminNatif, Index: indexBloc}
-				charCount = 0
 			}
 			blocCourant.Lignes = append(blocCourant.Lignes, LigneSource{Coordonnees: currentTags, Texte: textPur})
-			charCount += len(textPur)
 		}
 	}
-
 	if len(blocCourant.Lignes) > 0 {
 		blocs = append(blocs, blocCourant)
 	}
@@ -362,272 +434,20 @@ func parserFichierOCR(ocrPath string) ([]BlockMajeur, error) {
 	return blocs, nil
 }
 
-// --- MOTEUR LLM ---
-func interrogerLLM(texte string) []ErreurDetecteePropre {
-	url := "http://localhost:11434/api/generate"
-
-	// Ingénierie de prompt défensive ciblant spécifiquement les erreurs de Qwen 1.5b
-	prompt := fmt.Sprintf(`Tu es un correcteur orthographique d'élite.
-Ta mission est d'identifier UNIQUEMENT les vraies coquilles (erreurs de frappe évidentes, comme "sas" au lieu de "sans") ou les erreurs grammaticales claires.
-
-RÈGLES DE PÉNALITÉ ABSOLUES :
-1. INTERDICTION FORMELLE de modifier les majuscules en début de phrase ou de mot (ex: "L'oubli" DOIT rester "L'oubli").
-2. INTERDICTION FORMELLE de modifier la ponctuation ou de casser les apostrophes (ex: "L'oubli" ne devient jamais "leoubli").
-3. Si le texte ne contient aucune véritable faute de frappe, renvoie EXACTEMENT et UNIQUEMENT : []
-4. Réponds UNIQUEMENT par un tableau JSON valide.
-
-Format strict attendu (crée un objet par faute trouvée) :
-[
-  {
-    "phrase_originale": "Texte exact fourni.",
-    "mot_faux": "sas",
-    "mot_corrige": "sans"
-  }
-]
-
-Texte à analyser :
-%s`, texte)
-
-	reqBody := LLMRequest{
-		Model:  "qwen2.5:1.5b",
-		Prompt: prompt,
-		Stream: false,
-		Format: "json",
-		Options: LLMOption{
-			Temperature:   0.0,
-			RepeatPenalty: 1.15,
-			NumCtx:        2048,
-			NumPredict:    1024,
-		},
+// --- LOGIQUE MÉTIER ---
+func lancerAuditDetection() {
+	if err := validerPreRequisLLM(); err != nil {
+		fmt.Printf("\n%s[Erreur Critique] %v%s\n", ColorRed, err, ColorReset)
+		return
 	}
 
-	jsonData, _ := json.Marshal(reqBody)
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	var llmResp LLMResponse
-	json.Unmarshal(body, &llmResp)
-
-	rawOutput := strings.TrimSpace(llmResp.Response)
-
-	if strings.HasPrefix(rawOutput, "```json") {
-		rawOutput = strings.TrimPrefix(rawOutput, "```json")
-	} else if strings.HasPrefix(rawOutput, "```") {
-		rawOutput = strings.TrimPrefix(rawOutput, "```")
-	}
-	rawOutput = strings.TrimSuffix(rawOutput, "```")
-	cleanJSON := strings.TrimSpace(rawOutput)
-
-	if strings.HasPrefix(cleanJSON, "{") && strings.HasSuffix(cleanJSON, "}") {
-		cleanJSON = "[" + cleanJSON + "]"
-	}
-
-	var erreursDynamiques []map[string]interface{}
-	errUnmarshall := json.Unmarshal([]byte(cleanJSON), &erreursDynamiques)
-
-	if errUnmarshall != nil {
-		if cleanJSON != "[]" && cleanJSON != "" {
-			logDebugLLM(cleanJSON, errUnmarshall.Error())
-		}
-		return nil
-	}
-
-	var erreursPropres []ErreurDetecteePropre
-
-	for _, errMap := range erreursDynamiques {
-		phraseOrig := parseFlexString(errMap["phrase_originale"])
-		mFaux := parseFlexString(errMap["mot_faux"])
-		mCorr := parseFlexString(errMap["mot_corrige"])
-
-		if phraseOrig != "" && mFaux != "" && mCorr != "" {
-			// Validation de sécurité : Empêcher le modèle de s'auto-corriger sur la casse du premier mot
-			if strings.EqualFold(mFaux, mCorr) {
-				continue
-			}
-
-			erreursPropres = append(erreursPropres, ErreurDetecteePropre{
-				PhraseOriginale: phraseOrig,
-				MotFaux:         mFaux,
-				MotCorrige:      mCorr,
-			})
-		}
-	}
-
-	// TRACE ABSOLUE : Si aucune erreur VALIDE n'a été retenue, on log la réponse brute
-	if len(erreursPropres) == 0 && len(texte) > 3 {
-		logTraceZeroFaute(texte, cleanJSON)
-	}
-
-	return erreursPropres
-}
-
-// --- COLORISATION RICH TEXT ---
-func getRichTextRuns(phrase string, targetWord string, colorHex string) []excelize.RichTextRun {
-	if targetWord == "" || strings.TrimSpace(targetWord) == "aucun" || strings.TrimSpace(phrase) == "" {
-		return []excelize.RichTextRun{{Text: phrase}}
-	}
-
-	runesPhrase := []rune(phrase)
-	phraseLower := []rune(strings.ToLower(phrase))
-	colors := make([]bool, len(runesPhrase))
-
-	tLower := []rune(strings.ToLower(strings.TrimSpace(targetWord)))
-
-	if len(tLower) > 0 {
-		for i := 0; i <= len(phraseLower)-len(tLower); i++ {
-			match := true
-			for j := range tLower {
-				if phraseLower[i+j] != tLower[j] {
-					match = false
-					break
-				}
-			}
-			if match {
-				for j := range tLower {
-					colors[i+j] = true
-				}
-			}
-		}
-	}
-
-	var runs []excelize.RichTextRun
-	if len(runesPhrase) == 0 {
-		return runs
-	}
-
-	runStart := 0
-	currentIsColor := colors[0]
-
-	for i := 1; i < len(runesPhrase); i++ {
-		if colors[i] != currentIsColor {
-			if currentIsColor {
-				runs = append(runs, excelize.RichTextRun{Text: string(runesPhrase[runStart:i]), Font: &excelize.Font{Color: colorHex, Bold: true}})
-			} else {
-				runs = append(runs, excelize.RichTextRun{Text: string(runesPhrase[runStart:i])})
-			}
-			runStart = i
-			currentIsColor = colors[i]
-		}
-	}
-
-	if currentIsColor {
-		runs = append(runs, excelize.RichTextRun{Text: string(runesPhrase[runStart:]), Font: &excelize.Font{Color: colorHex, Bold: true}})
-	} else {
-		runs = append(runs, excelize.RichTextRun{Text: string(runesPhrase[runStart:])})
-	}
-
-	return runs
-}
-
-// --- MOTEUR D'INJECTION COM ---
-func corrigerOfficeCOM_Batch(chemin string, remplacements []RemplacementAgrege, typeFichier string) error {
-	var psBuilder strings.Builder
-	if typeFichier == ".docx" {
-		psBuilder.WriteString(fmt.Sprintf(`
-$ErrorActionPreference = 'Stop'
-try {
-    $word = New-Object -ComObject Word.Application
-    $word.Visible = $false
-    $word.DisplayAlerts = $false
-    $doc = $word.Documents.Open('%s')
-    $find = $doc.Content.Find
-`, chemin))
-		for _, remp := range remplacements {
-			origClean := strings.ReplaceAll(remp.Original, "'", "''")
-			corrClean := strings.ReplaceAll(remp.CorrectionFinal, "'", "''")
-			psBuilder.WriteString(fmt.Sprintf(`$find.Execute('%s', $false, $false, $false, $false, $false, $true, 1, $false, '%s', 2) | Out-Null; `, origClean, corrClean))
-		}
-		psBuilder.WriteString(`
-    $doc.Save()
-    $doc.Close()
-    $word.Quit()
-    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
-    [GC]::Collect()
-} catch { exit 1 }
-`)
-	} else if typeFichier == ".pptx" {
-		psBuilder.WriteString(fmt.Sprintf(`
-$ErrorActionPreference = 'Stop'
-try {
-    $ppt = New-Object -ComObject PowerPoint.Application
-    $pres = $ppt.Presentations.Open('%s', $false, $false, $false)
-    foreach ($slide in $pres.Slides) {
-        foreach ($shape in $slide.Shapes) {
-            if ($shape.HasTextFrame) {
-                $txt = $shape.TextFrame.TextRange.Text
-`, chemin))
-		for _, remp := range remplacements {
-			origClean := strings.ReplaceAll(remp.Original, "'", "''")
-			corrClean := strings.ReplaceAll(remp.CorrectionFinal, "'", "''")
-			psBuilder.WriteString(fmt.Sprintf(`if ($txt -match [regex]::Escape('%s')) { $txt = $txt -replace [regex]::Escape('%s'), '%s' }; `, origClean, origClean, corrClean))
-		}
-		psBuilder.WriteString(`
-                $shape.TextFrame.TextRange.Text = $txt
-            }
-        }
-    }
-    $pres.Save()
-    $pres.Close()
-    $ppt.Quit()
-    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ppt) | Out-Null
-    [GC]::Collect()
-} catch { exit 1 }
-`)
-	}
-	err := exec.Command("powershell", "-NoProfile", "-Command", psBuilder.String()).Run()
-	if err != nil {
-		return fmt.Errorf("échec API COM")
-	}
-	return nil
-}
-
-func corrigerExcel_Batch(chemin string, remplacements []RemplacementAgrege) error {
-	xl, err := excelize.OpenFile(bypassMaxPath(chemin))
-	if err != nil {
-		return err
-	}
-	defer xl.Close()
-
-	for _, sheetName := range xl.GetSheetList() {
-		rows, _ := xl.GetRows(sheetName)
-		for rowIndex, row := range rows {
-			for colIndex, cellValue := range row {
-				for _, remp := range remplacements {
-					if strings.Contains(cellValue, remp.Original) {
-						newVal := strings.Replace(cellValue, remp.Original, remp.CorrectionFinal, 1)
-						cellName, _ := excelize.CoordinatesToCellName(colIndex+1, rowIndex+1)
-						xl.SetCellValue(sheetName, cellName, newVal)
-						cellValue = newVal
-					}
-				}
-			}
-		}
-	}
-	return xl.Save()
-}
-
-// --- FLUX PRINCIPAL (PHASE 1) ---
-func phase1Analyse() {
 	purgerMemoireAutomatique()
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		fmt.Println("\n\n" + ColorYellow + "[Arrêt Demandé] Sauvegarde de la progression en cours..." + ColorReset)
+		fmt.Println("\n\n" + ColorYellow + "[Arrêt Demandé] Sauvegarde en cours..." + ColorReset)
 		atomic.StoreInt32(&stopRequested, 1)
 	}()
 
@@ -642,16 +462,16 @@ func phase1Analyse() {
 	}
 
 	desktopPath := getDesktopPath()
-	rapportPath := filepath.Join(desktopPath, "Audit_Corrections.xlsx")
+	rapportPath := filepath.Join(desktopPath, "Rapport_Audit_Linguistique.xlsx")
 	statePath := filepath.Join(desktopPath, "Audit_State.json")
-
 	stateDB := loadState(statePath)
+
 	var f *excelize.File
 	currentRow := 6
-	sheet := "Audit_Corrections"
+	sheet := "Resultats_Audit"
 
 	if _, err := os.Stat(bypassMaxPath(rapportPath)); err == nil {
-		fmt.Println(ColorGreen + "[Info] Fichier d'audit existant détecté. Mode Reprise activé." + ColorReset)
+		fmt.Println(ColorGreen + "[Info] Fichier d'audit existant détecté. Reprise du scan." + ColorReset)
 		f, _ = excelize.OpenFile(rapportPath)
 		rows, _ := f.GetRows(sheet)
 		if len(rows) >= 5 {
@@ -661,47 +481,38 @@ func phase1Analyse() {
 		f = excelize.NewFile()
 		f.SetSheetName("Sheet1", sheet)
 
-		f.SetCellValue(sheet, "A1", "RAPPORT D'AUDIT LLM (Piloté par Data OCR)")
-		f.SetCellValue(sheet, "A2", "Note explicative : Ce fichier centralise les fautes isolées par le modèle.")
-		f.SetCellValue(sheet, "A3", "Les données commencent à la ligne 5 pour respecter le standard de présentation.")
-
-		f.MergeCell(sheet, "A1", "H1")
-		f.MergeCell(sheet, "A2", "H2")
-		f.MergeCell(sheet, "A3", "H3")
+		f.SetCellValue(sheet, "A1", "RAPPORT D'AUDIT LINGUISTIQUE (Moteur de Détection Linter)")
+		f.SetCellValue(sheet, "A2", "Note : Version archivée. Ce document liste les erreurs isolées par l'IA.")
+		f.MergeCell(sheet, "A1", "D1")
+		f.MergeCell(sheet, "A2", "D2")
 
 		styleIntro, _ := f.NewStyle(&excelize.Style{
 			Font:      &excelize.Font{Bold: true, Color: "#333333"},
 			Alignment: &excelize.Alignment{Horizontal: "left", Vertical: "center"},
 		})
-		f.SetCellStyle(sheet, "A1", "H3", styleIntro)
+		f.SetCellStyle(sheet, "A1", "A2", styleIntro)
 
 		styleData, _ := f.NewStyle(&excelize.Style{
 			Alignment: &excelize.Alignment{WrapText: true, Vertical: "top"},
 		})
-		f.SetColStyle(sheet, "A:H", styleData)
+		f.SetColStyle(sheet, "A:D", styleData)
 
 		styleTitre, _ := f.NewStyle(&excelize.Style{
-			Fill:      excelize.Fill{Type: "pattern", Color: []string{"#000080"}, Pattern: 1},
+			Fill:      excelize.Fill{Type: "pattern", Color: []string{"#002060"}, Pattern: 1},
 			Font:      &excelize.Font{Bold: true, Color: "#FFFFFF"},
 			Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center", WrapText: true},
 		})
 
-		enTetes := []string{"Coordonnées", "Chemin du fichier (Natif)", "Texte de la balise", "Aperçu (Correction Unitaire)", "Statut d'injection", "Validation (v/r)", "Tech_Faux", "Tech_Corrige"}
+		enTetes := []string{"Coordonnées", "Chemin du fichier (Natif)", "Texte Original (Faute en rouge)", "Suggestion de Correction (En vert)"}
 		for i, colName := range enTetes {
 			cell := string(rune('A'+i)) + "5"
 			f.SetCellValue(sheet, cell, colName)
 			f.SetCellStyle(sheet, cell, cell, styleTitre)
 		}
 
-		f.SetColWidth(sheet, "A", "A", 25)
-		f.SetColWidth(sheet, "B", "B", 35)
-		f.SetColWidth(sheet, "C", "C", 55)
-		f.SetColWidth(sheet, "D", "D", 55)
-		f.SetColWidth(sheet, "E", "E", 20)
-		f.SetColWidth(sheet, "F", "F", 20)
-
-		f.SetColVisible(sheet, "G", false)
-		f.SetColVisible(sheet, "H", false)
+		f.SetColWidth(sheet, "A", "A", 30)
+		f.SetColWidth(sheet, "B", "B", 40)
+		f.SetColWidth(sheet, "C", "D", 70)
 	}
 
 	var fichiersOCR []string
@@ -713,20 +524,27 @@ func phase1Analyse() {
 	})
 
 	if len(fichiersOCR) == 0 {
-		fmt.Println(ColorYellow + "Aucun fichier .ocr.txt trouvé." + ColorReset)
+		fmt.Println(ColorYellow + "Aucun fichier '.ocr.txt' trouvé." + ColorReset)
 		return
 	}
 
 	var tousLesBlocs []BlockMajeur
 	for _, path := range fichiersOCR {
-		blocs, _ := parserFichierOCR(path)
-		for _, b := range blocs {
-			tousLesBlocs = append(tousLesBlocs, b)
+		blocs, err := parserFichierOCR(path)
+		if err == nil {
+			for _, b := range blocs {
+				tousLesBlocs = append(tousLesBlocs, b)
+			}
 		}
 	}
-	totalBlocsGlobal := len(tousLesBlocs)
 
-	fmt.Printf("%s[Step] Traitement par IA (%d blocs) (Ctrl+C pour arrêter proprement)%s\n", ColorBlue, totalBlocsGlobal, ColorReset)
+	totalBlocsGlobal := len(tousLesBlocs)
+	if totalBlocsGlobal == 0 {
+		fmt.Println(ColorYellow + "Traitement annulé : Aucun texte valide." + ColorReset)
+		return
+	}
+
+	fmt.Printf("%s[Step] Audit en cours (%d micro-blocs) (Ctrl+C pour arrêter)%s\n", ColorBlue, totalBlocsGlobal, ColorReset)
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -750,40 +568,50 @@ func phase1Analyse() {
 		semaphore <- struct{}{}
 
 		go func(b BlockMajeur, bKey string) {
-			defer wg.Done()
-			defer func() { <-semaphore }()
-
-			for _, ls := range b.Lignes {
-				textePropre := strings.TrimSpace(ls.Texte)
-				if len(textePropre) < 3 {
-					continue
+			defer func() {
+				if r := recover(); r != nil {
+					// Ignoré silencieusement pour ne pas polluer la console en mode prod
 				}
+				<-semaphore
+				wg.Done()
+			}()
 
-				erreurs := interrogerLLM(textePropre)
+			var batchPhrases []string
+			for _, ls := range b.Lignes {
+				batchPhrases = append(batchPhrases, ls.Texte)
+			}
+
+			if len(batchPhrases) > 0 {
+				anomalies := interrogerLLM_Detection(batchPhrases)
 
 				mu.Lock()
-				if len(erreurs) > 0 {
-					for _, errDetect := range erreurs {
-						if errDetect.MotFaux != "" && strings.Contains(textePropre, errDetect.MotFaux) {
+				if len(anomalies) > 0 {
+					for _, anom := range anomalies {
+						for _, ls := range b.Lignes {
+							if strings.Contains(ls.Texte, anom.PhraseOriginale) || strings.Contains(anom.PhraseOriginale, ls.Texte) {
 
-							phraseUnitaire := strings.Replace(textePropre, errDetect.MotFaux, errDetect.MotCorrige, 1)
+								f.SetCellValue(sheet, fmt.Sprintf("A%d", currentRow), ls.Coordonnees)
+								f.SetCellValue(sheet, fmt.Sprintf("B%d", currentRow), b.Chemin)
 
-							f.SetCellValue(sheet, fmt.Sprintf("A%d", currentRow), ls.Coordonnees)
-							f.SetCellValue(sheet, fmt.Sprintf("B%d", currentRow), b.Chemin)
+								reReplace := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(anom.MotFaux) + `\b`)
+								phraseCorrigee := reReplace.ReplaceAllString(anom.PhraseOriginale, anom.MotCorrige)
 
-							runsOrig := getRichTextRuns(textePropre, errDetect.MotFaux, "FF0000")
-							f.SetCellRichText(sheet, fmt.Sprintf("C%d", currentRow), runsOrig)
+								if phraseCorrigee == anom.PhraseOriginale {
+									phraseCorrigee = strings.Replace(anom.PhraseOriginale, anom.MotFaux, anom.MotCorrige, 1)
+								}
 
-							runsCorr := getRichTextRuns(phraseUnitaire, errDetect.MotCorrige, "00B050")
-							f.SetCellRichText(sheet, fmt.Sprintf("D%d", currentRow), runsCorr)
+								cibleFaux, cibleCorrige := findExactDiff(anom.PhraseOriginale, phraseCorrigee)
 
-							f.SetCellValue(sheet, fmt.Sprintf("E%d", currentRow), "En attente Validation")
+								runsOrig := getRichTextRuns(anom.PhraseOriginale, cibleFaux, "FF0000") // Rouge
+								f.SetCellRichText(sheet, fmt.Sprintf("C%d", currentRow), runsOrig)
 
-							f.SetCellValue(sheet, fmt.Sprintf("G%d", currentRow), errDetect.MotFaux)
-							f.SetCellValue(sheet, fmt.Sprintf("H%d", currentRow), errDetect.MotCorrige)
+								runsCorr := getRichTextRuns(phraseCorrigee, cibleCorrige, "00B050") // Vert
+								f.SetCellRichText(sheet, fmt.Sprintf("D%d", currentRow), runsCorr)
 
-							currentRow++
-							erreursTrouveesGlobal++
+								currentRow++
+								erreursTrouveesGlobal++
+								break
+							}
 						}
 					}
 				}
@@ -793,13 +621,11 @@ func phase1Analyse() {
 			mu.Lock()
 			stateDB.Processed[bKey] = true
 			blocsTraitesGlobal++
-			afficherBarreProgression(blocsTraitesGlobal, totalBlocsGlobal, "Analyse LLM")
-
+			afficherBarreProgression(blocsTraitesGlobal, totalBlocsGlobal, "Détection LLM")
 			if blocsTraitesGlobal%5 == 0 {
 				saveState(statePath, stateDB)
 			}
 			mu.Unlock()
-
 		}(bloc, blockKey)
 	}
 
@@ -815,176 +641,28 @@ func phase1Analyse() {
 	} else {
 		fmt.Println(ColorGreen + "          TRAITEMENT TERMINÉ             " + ColorReset)
 	}
-	fmt.Printf("Fautes isolées dans le rapport : %d\n", erreursTrouveesGlobal)
+	fmt.Printf("Fautes réelles isolées et colorisées : %d\n", erreursTrouveesGlobal)
 	fmt.Println(ColorGreen + "=========================================" + ColorReset)
 }
 
-// --- FLUX PRINCIPAL (PHASE 2) ---
-func phase2Correction() {
-	purgerMemoireAutomatique()
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		fmt.Println("\n\n" + ColorYellow + "[Arrêt Demandé] Terminaison et sauvegarde..." + ColorReset)
-		atomic.StoreInt32(&stopRequested, 1)
-	}()
-
-	rapportPath := filepath.Join(getDesktopPath(), "Audit_Corrections.xlsx")
-	f, err := excelize.OpenFile(bypassMaxPath(rapportPath))
-	if err != nil {
-		fmt.Println(ColorRed + "Erreur : Rapport d'audit introuvable sur le bureau." + ColorReset)
-		return
-	}
-	defer f.Close()
-
-	rows, _ := f.GetRows("Audit_Corrections")
-
-	planDActionBrut := make(map[string]map[string][]ActionUnitaire)
-
-	for i := 5; i < len(rows); i++ {
-		row := rows[i]
-		if len(row) < 8 {
-			continue
-		}
-
-		cheminNatif := row[1]
-		original := row[2]
-		statutActuel := row[4]
-		validation := strings.ToLower(strings.TrimSpace(row[5]))
-		motFaux := row[6]
-		motCorrige := row[7]
-
-		if statutActuel == "Validé et Injecté" || statutActuel == "Ignoré (Refusé)" {
-			continue
-		}
-
-		if validation != "v" {
-			f.SetCellValue("Audit_Corrections", fmt.Sprintf("E%d", i+1), "Ignoré (Refusé)")
-			continue
-		}
-
-		if planDActionBrut[cheminNatif] == nil {
-			planDActionBrut[cheminNatif] = make(map[string][]ActionUnitaire)
-		}
-
-		planDActionBrut[cheminNatif][original] = append(planDActionBrut[cheminNatif][original], ActionUnitaire{
-			MotFaux:    motFaux,
-			MotCorrige: motCorrige,
-			LigneExcel: i + 1,
-		})
-	}
-
-	totalFichiers := len(planDActionBrut)
-	if totalFichiers == 0 {
-		fmt.Println(ColorYellow + "Aucune nouvelle correction validée ('v') à appliquer." + ColorReset)
-		f.SaveAs(rapportPath)
-		return
-	}
-
-	fmt.Printf("%s[Step] Injection dans %d fichiers (Ctrl+C pour interrompre)...%s\n", ColorBlue, totalFichiers, ColorReset)
-	fichiersTraites := 0
-
-	for chemin, mapPhrases := range planDActionBrut {
-		if atomic.LoadInt32(&stopRequested) == 1 {
-			break
-		}
-
-		var listeAgregee []RemplacementAgrege
-		for phraseOrig, actions := range mapPhrases {
-			phraseEvolutive := phraseOrig
-			var lignesConcernees []int
-
-			for _, act := range actions {
-				phraseEvolutive = strings.Replace(phraseEvolutive, act.MotFaux, act.MotCorrige, 1)
-				lignesConcernees = append(lignesConcernees, act.LigneExcel)
-			}
-
-			listeAgregee = append(listeAgregee, RemplacementAgrege{
-				Original:        phraseOrig,
-				CorrectionFinal: phraseEvolutive,
-				LignesExcel:     lignesConcernees,
-			})
-		}
-
-		var errInjection error
-		if errVerrou := verifierVerrouFichier(chemin); errVerrou != nil {
-			errInjection = errVerrou
-		} else {
-			ext := strings.ToLower(filepath.Ext(chemin))
-			switch ext {
-			case ".txt", ".md":
-				contentBytes, err := os.ReadFile(bypassMaxPath(chemin))
-				if err != nil {
-					errInjection = err
-				} else {
-					newContent := string(contentBytes)
-					for _, remp := range listeAgregee {
-						newContent = strings.Replace(newContent, remp.Original, remp.CorrectionFinal, 1)
-					}
-					attendreDisqueOptimal(60)
-					errInjection = os.WriteFile(bypassMaxPath(chemin), []byte(newContent), 0644)
-				}
-			case ".docx", ".pptx":
-				attendreDisqueOptimal(60)
-				errInjection = corrigerOfficeCOM_Batch(chemin, listeAgregee, ext)
-			case ".xlsx", ".xlsm":
-				attendreDisqueOptimal(60)
-				errInjection = corrigerExcel_Batch(chemin, listeAgregee)
-			}
-		}
-
-		for _, remp := range listeAgregee {
-			for _, ligneExcel := range remp.LignesExcel {
-				celluleStatut := fmt.Sprintf("E%d", ligneExcel)
-				if errInjection != nil {
-					styleErr, _ := f.NewStyle(&excelize.Style{Fill: excelize.Fill{Type: "pattern", Color: []string{"#f8d7da"}, Pattern: 1}, Font: &excelize.Font{Color: "#721c24"}})
-					f.SetCellValue("Audit_Corrections", celluleStatut, "Erreur : "+errInjection.Error())
-					f.SetCellStyle("Audit_Corrections", celluleStatut, celluleStatut, styleErr)
-				} else {
-					styleOk, _ := f.NewStyle(&excelize.Style{Fill: excelize.Fill{Type: "pattern", Color: []string{"#d4edda"}, Pattern: 1}, Font: &excelize.Font{Color: "#155724"}})
-					f.SetCellValue("Audit_Corrections", celluleStatut, "Validé et Injecté")
-					f.SetCellStyle("Audit_Corrections", celluleStatut, celluleStatut, styleOk)
-				}
-			}
-		}
-
-		fichiersTraites++
-		afficherBarreProgression(fichiersTraites, totalFichiers, "Injection Physique")
-		f.SaveAs(rapportPath)
-	}
-
-	fmt.Println(ColorGreen + "\n\n=========================================" + ColorReset)
-	if atomic.LoadInt32(&stopRequested) == 1 {
-		fmt.Println(ColorYellow + "      INJECTION INTERROMPUE PROPREMENT   " + ColorReset)
-	} else {
-		fmt.Println(ColorGreen + "          INJECTION TERMINÉE             " + ColorReset)
-	}
-	fmt.Println(ColorGreen + "=========================================" + ColorReset)
-}
-
-// --- MENU ---
 func main() {
 	for {
 		atomic.StoreInt32(&stopRequested, 0)
-		fmt.Println("\n" + ColorYellow + "=== OUTIL DE CORRECTION MASSIVE ===" + ColorReset)
-		fmt.Println("1 - Phase 1 - Analyser la base de données OCR")
-		fmt.Println("2 - Phase 2 - Injecter les corrections dans les fichiers natifs")
-		fmt.Println("3 - Quitter")
+		fmt.Println("\n" + ColorYellow + "=== OUTIL D'AUDIT LINGUISTIQUE (Archive Finale) ===" + ColorReset)
+		fmt.Println("1 - Lancer l'analyse (Détection & Colorisation)")
+		fmt.Println("2 - Quitter")
 		fmt.Print(ColorCyan + "Choix : " + ColorReset)
 
 		scanner := bufio.NewScanner(os.Stdin)
 		scanner.Scan()
+
 		switch strings.TrimSpace(scanner.Text()) {
 		case "1":
-			phase1Analyse()
+			lancerAuditDetection()
 		case "2":
-			phase2Correction()
-		case "3":
 			os.Exit(0)
 		default:
-			fmt.Println(ColorRed + "Choix invalide." + ColorReset)
+			fmt.Println(ColorRed + "Saisie invalide." + ColorReset)
 		}
 	}
 }
