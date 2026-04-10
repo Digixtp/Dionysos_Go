@@ -2,10 +2,9 @@
 Titre : Moteur d'Orchestration Wispr.Bridge
 Auteur : Digixtp
 Version : 4.0.0
-Objectif : Moteur de transcription Air-Gapped propulsé par CUDA. Intègre une UX interactive
-           en ligne de commande, la découverte dynamique d'un dictionnaire sémantique JSON,
-           le formatage Markdown pour Joplin et une gestion stricte des processus (Anti-zombies)
-           ainsi que des fichiers (Quarantaine).
+Note introductive : Ce script Go agit comme un pont d'orchestration pour le moteur de transcription Whisper (CUDA). Il scanne un répertoire d'entrée, exécute l'inférence audio en mode masqué (Headless) et génère une note Markdown enrichie sémantiquement avant de l'injecter dans Joplin via son API locale. Il garantit une sécurité absolue des données via une mise en quarantaine horodatée (Move-Only) et intègre une validation stricte de l'environnement (Fail-Fast).
+Prérequis : Go 1.20+, Whisper.cpp (binaire CLI compilé CUDA), Modèle Large-V3-Turbo, Joplin (Web Clipper activé).
+Commande d'utilisation : go run Wispr_Bridge.go
 */
 
 package main
@@ -21,27 +20,27 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 	"unsafe"
 )
 
-// Variables d'environnement et d'API
+// -----------------------------------------------------------------------------
+// Configuration globale, Variables d'environnement et Charte Graphique ANSI
+// -----------------------------------------------------------------------------
 const (
 	JoplinToken = "034a2ee109ad401f8246296d7def3edc28dd73accdb49744f1438227784990e56d4e011cdbaa903282931f185dc5ebaee6e9fa5f85de2951612c4f7d0deac651"
 	JoplinPort  = "41184"
 	TargetName  = "Wispr_Bridge"
 )
 
-// Codes ANSI pour la standardisation visuelle du terminal
 const (
-	ColorReset  = "\033[0m"
-	ColorCyan   = "\033[96m"
-	ColorGreen  = "\033[92m"
-	ColorRed    = "\033[91m"
-	ColorBlue   = "\033[94m"
-	ColorYellow = "\033[93m"
+	ANSI_Reset  = "\033[0m"
+	ANSI_Vert   = "\033[92m" // Titre principal, note introductive, sous-parties, succès
+	ANSI_Orange = "\033[93m" // Avertissements, info, alertes non bloquantes
+	ANSI_Rouge  = "\033[91m" // Erreurs critiques et blocages système
 )
 
 // Structures JSON pour l'API Joplin
@@ -73,23 +72,24 @@ func init() {
 	kernel32 := syscall.NewLazyDLL("kernel32.dll")
 	getConsoleMode := kernel32.NewProc("GetConsoleMode")
 	setConsoleMode := kernel32.NewProc("SetConsoleMode")
-
 	getConsoleMode.Call(uintptr(handle), uintptr(unsafe.Pointer(&mode)))
 	mode |= 0x0004 // ENABLE_VIRTUAL_TERMINAL_PROCESSING
 	setConsoleMode.Call(uintptr(handle), uintptr(mode))
 }
 
 func main() {
-	fmt.Printf("%s=== Moteur Wispr.Bridge v4.0.0 (Production) ===%s\n", ColorCyan, ColorReset)
+	fmt.Printf("%s=== Moteur Wispr.Bridge v4.0.0 (Production) ===%s\n", ANSI_Vert, ANSI_Reset)
 
-	// Étape 1 : Pont API et routage dynamique
+	// -----------------------------------------------------------------------------
+	// Phase Préliminaire : Validation des prérequis (Fail-Fast) et Routage dynamique
+	// -----------------------------------------------------------------------------
 	notebookID := getJoplinFolderID(TargetName)
 	if notebookID == "" {
-		fmt.Printf("%s[Erreur] Carnet '%s' introuvable dans Joplin. Veuillez le créer et relancer.%s\n", ColorRed, TargetName, ColorReset)
+		fmt.Printf("%s[ERREUR] Carnet '%s' introuvable dans Joplin. Veuillez le créer et relancer.%s\n", ANSI_Rouge, TargetName, ANSI_Reset)
 		return
 	}
 
-	// Définition des chemins via l'équivalent Pathlib en Go (Agnosticisme matériel)
+	// Définition dynamique des chemins (Agnosticisme matériel)
 	homeDir, _ := os.UserHomeDir()
 	inputDir := filepath.Join(homeDir, "Documents", "Wispr_Bridge")
 	quarantineDir := filepath.Join(homeDir, "Desktop", "fichier à supprimer")
@@ -105,43 +105,54 @@ func main() {
 	// Découverte du binaire d'inférence
 	whisperCliPath := findExecutable(homeDir)
 	if whisperCliPath == "" {
-		fmt.Printf("%s[Erreur] Exécutable whisper-cli.exe introuvable.%s\n", ColorRed, ColorReset)
+		fmt.Printf("%s[ERREUR] Exécutable whisper-cli.exe introuvable.%s\n", ANSI_Rouge, ANSI_Reset)
 		return
 	}
 
 	// Découverte du modèle IA Large-V3-Turbo
 	whisperModelPath := findModel(modelsDir)
 	if whisperModelPath == "" {
-		fmt.Printf("%s[Erreur] Aucun modèle IA (large-v3-turbo) trouvé dans le dossier models.%s\n", ColorRed, ColorReset)
+		fmt.Printf("%s[ERREUR] Aucun modèle IA (large-v3-turbo) trouvé dans le dossier models.%s\n", ANSI_Rouge, ANSI_Reset)
 		return
 	}
-	fmt.Printf("%s[Ok] Environnement validé. Modèle : %s%s\n", ColorGreen, filepath.Base(whisperModelPath), ColorReset)
 
-	// Étape 2 : Scan unique du dossier (Exécution Batch)
+	fmt.Printf("%s[OK] Environnement validé. Modèle : %s%s\n", ANSI_Vert, filepath.Base(whisperModelPath), ANSI_Reset)
+
+	// -----------------------------------------------------------------------------
+	// Phase 1 : Scan unique du dossier (Exécution Batch)
+	// -----------------------------------------------------------------------------
 	audioFiles := scanDirectoryForAudio(inputDir)
-
 	if len(audioFiles) == 0 {
-		fmt.Printf("\n%s[Info] Aucun fichier audio à traiter dans l'entrée. Arrêt propre du moteur.%s\n", ColorCyan, ColorReset)
+		fmt.Printf("\n%s[INFO] Aucun fichier audio à traiter dans l'entrée. Arrêt propre du moteur.%s\n", ANSI_Orange, ANSI_Reset)
 		time.Sleep(2 * time.Second)
 		return
 	}
 
-	// Étape 3 : Menu interactif semi-automatique
+	// -----------------------------------------------------------------------------
+	// Phase 2 : Menu interactif semi-automatique
+	// -----------------------------------------------------------------------------
 	if !promptUserMenu(len(audioFiles)) {
-		fmt.Printf("\n%s[Info] Interruption demandée. À bientôt.%s\n", ColorCyan, ColorReset)
+		fmt.Printf("\n%s[INFO] Interruption demandée. À bientôt.%s\n", ANSI_Orange, ANSI_Reset)
 		return
 	}
 
-	// Étape 4 : Traitement séquentiel de la file d'attente
+	// -----------------------------------------------------------------------------
+	// Phase 3 : Traitement séquentiel de la file d'attente
+	// -----------------------------------------------------------------------------
 	processAudioBatch(audioFiles, inputDir, quarantineDir, whisperCliPath, whisperModelPath, notebookID, semanticRules)
 
-	fmt.Printf("\n%s=== Traitement terminé avec succès. Fermeture du script. ===%s\n", ColorGreen, ColorReset)
+	fmt.Printf("\n%s=== Traitement terminé avec succès. Fermeture du script. ===%s\n", ANSI_Vert, ANSI_Reset)
+
+	// -----------------------------------------------------------------------------
+	// Phase 4 : Nettoyage Mémoire stricte
+	// -----------------------------------------------------------------------------
+	runtime.GC()
 	time.Sleep(3 * time.Second)
 }
 
-// ---------------------------------------------------------
+// =============================================================================
 // FONCTIONS MÉTIERS ET ORCHESTRATION
-// ---------------------------------------------------------
+// =============================================================================
 
 // Parcours du dossier pour isoler uniquement les formats audio cibles
 func scanDirectoryForAudio(inputDir string) []os.DirEntry {
@@ -157,7 +168,6 @@ func scanDirectoryForAudio(inputDir string) []os.DirEntry {
 			audioFiles = append(audioFiles, file)
 		}
 	}
-
 	return audioFiles
 }
 
@@ -165,10 +175,10 @@ func scanDirectoryForAudio(inputDir string) []os.DirEntry {
 func promptUserMenu(fileCount int) bool {
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Printf("\n%s=== %d fichier(s) audio détecté(s) ===%s\n", ColorYellow, fileCount, ColorReset)
+		fmt.Printf("\n%s=== %d fichier(s) audio détecté(s) ===%s\n", ANSI_Orange, fileCount, ANSI_Reset)
 		fmt.Println("1. Lancer la transcription")
 		fmt.Println("2. Quitter")
-		fmt.Print(ColorCyan + "Sélectionnez une option (1 ou 2) : " + ColorReset)
+		fmt.Print(ANSI_Vert + "Sélectionnez une option (1 ou 2) : " + ANSI_Reset)
 
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
@@ -178,7 +188,7 @@ func promptUserMenu(fileCount int) bool {
 		} else if input == "2" {
 			return false
 		} else {
-			fmt.Printf("%s[Erreur] Saisie invalide. Veuillez taper 1 ou 2.%s\n", ColorRed, ColorReset)
+			fmt.Printf("%s[ERREUR] Saisie invalide. Veuillez taper 1 ou 2.%s\n", ANSI_Rouge, ANSI_Reset)
 		}
 	}
 }
@@ -190,7 +200,7 @@ func processAudioBatch(files []os.DirEntry, inputDir, quarantineDir, cliPath, mo
 
 	for _, file := range files {
 		audioPath := filepath.Join(inputDir, file.Name())
-		fmt.Printf("\n%s[Step] Traitement Air-Gapped : %s%s\n", ColorBlue, file.Name(), ColorReset)
+		fmt.Printf("\n%s[ÉTAPE] Traitement Air-Gapped : %s%s\n", ANSI_Vert, file.Name(), ANSI_Reset)
 
 		txtPath := transcribeAudioSilently(audioPath, inputDir, cliPath, modelPath)
 		if txtPath == "" {
@@ -199,13 +209,14 @@ func processAudioBatch(files []os.DirEntry, inputDir, quarantineDir, cliPath, mo
 
 		transcriptionBytes, err := os.ReadFile(txtPath)
 		if err != nil {
-			fmt.Printf("%s[Erreur] Impossible de lire la transcription générée.%s\n", ColorRed, ColorReset)
+			fmt.Printf("%s[ERREUR] Impossible de lire la transcription générée.%s\n", ANSI_Rouge, ANSI_Reset)
 			continue
 		}
-		rawText := strings.TrimSpace(strings.ReplaceAll(string(transcriptionBytes), "\r\n", "\n"))
 
+		rawText := strings.TrimSpace(strings.ReplaceAll(string(transcriptionBytes), "\r\n", "\n"))
 		matches := regexDate.FindStringSubmatch(file.Name())
 		var dateStr, timeStr, noteTitle string
+
 		if len(matches) >= 6 {
 			dateStr = fmt.Sprintf("%s/%s/20%s", matches[3], matches[2], matches[1])
 			timeStr = fmt.Sprintf("%s:%s", matches[4], matches[5])
@@ -217,15 +228,15 @@ func processAudioBatch(files []os.DirEntry, inputDir, quarantineDir, cliPath, mo
 		}
 
 		formattedMarkdown := generateSemanticMarkdown(noteTitle, dateStr, timeStr, rawText, semanticRules)
+		fmt.Printf("%s[INFO] Injection Markdown structurée dans Joplin...%s\n", ANSI_Vert, ANSI_Reset)
 
-		fmt.Printf("%s[Info] Injection Markdown structurée dans Joplin...%s\n", ColorCyan, ColorReset)
 		success := sendToJoplin(notebookID, noteTitle, formattedMarkdown)
 
-		// Règle Anti-Destruction stricte
+		// Règle Anti-Destruction stricte (Safe Execution : Move-Only)
 		if success {
 			moveToQuarantine(txtPath, quarantineDir)
 			moveToQuarantine(audioPath, quarantineDir)
-			fmt.Printf("%s[Ok] Traitement terminé et sécurisé (Move-Only).%s\n", ColorGreen, ColorReset)
+			fmt.Printf("%s[OK] Traitement terminé et sécurisé (Move-Only).%s\n", ANSI_Vert, ANSI_Reset)
 			counter++
 		}
 	}
@@ -234,8 +245,7 @@ func processAudioBatch(files []os.DirEntry, inputDir, quarantineDir, cliPath, mo
 // Génération ou chargement du référentiel sémantique externe (Agnosticisme métier)
 func loadOrGenerateSemanticConfig(configPath string) map[string]string {
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		fmt.Printf("%s[Info] Création du fichier de configuration sémantique (Emojis inclus)...%s\n", ColorYellow, ColorReset)
-
+		fmt.Printf("%s[INFO] Création du fichier de configuration sémantique (Emojis inclus)...%s\n", ANSI_Orange, ANSI_Reset)
 		defaultConfig := SemanticConfig{
 			Note: "Fichier de règles sémantiques. Les clés (contenant l'emoji et le thème) seront injectées en tant que sous-titres dans la note Markdown si la Regex correspondante est détectée dans la transcription. Sensibilité à la casse ignorée.",
 			Keywords: map[string]string{
@@ -270,7 +280,6 @@ func loadOrGenerateSemanticConfig(configPath string) map[string]string {
 // Moteur de rendu texte vers Markdown H1/H3
 func generateSemanticMarkdown(title, dateStr, timeStr, rawText string, semanticRules map[string]string) string {
 	var detectedDomains []string
-
 	for domain, pattern := range semanticRules {
 		matched, _ := regexp.MatchString(pattern, rawText)
 		if matched {
@@ -313,16 +322,17 @@ func transcribeAudioSilently(audioPath, inputDir, cliPath, modelPath string) str
 
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
+
 	spinner := []string{"|", "/", "-", "\\"}
 	spinIdx := 0
 
-	fmt.Print(ColorCyan + "[Info] Transcription GPU en cours ")
+	fmt.Print(ANSI_Orange + "[INFO] Transcription GPU en cours ")
 
 	for {
 		select {
 		case err := <-done:
 			if err == nil {
-				fmt.Printf("\r%s[Info] Transcription GPU en cours ... Terminée !%s          \n", ColorGreen, ColorReset)
+				fmt.Printf("\r%s[INFO] Transcription GPU en cours ... Terminée !%s          \n", ANSI_Vert, ANSI_Reset)
 			}
 			time.Sleep(2 * time.Second) // Flush SSD
 			base := strings.TrimSuffix(filepath.Base(audioPath), filepath.Ext(audioPath))
@@ -331,20 +341,22 @@ func transcribeAudioSilently(audioPath, inputDir, cliPath, modelPath string) str
 				return matches[0]
 			}
 			return ""
+
 		case <-ticker.C:
-			fmt.Printf("\r%s[Info] Transcription GPU en cours %s %s", ColorCyan, spinner[spinIdx], ColorReset)
+			fmt.Printf("\r%s[INFO] Transcription GPU en cours %s %s", ANSI_Orange, spinner[spinIdx], ANSI_Reset)
 			spinIdx = (spinIdx + 1) % len(spinner)
 		}
 	}
 }
 
-// ---------------------------------------------------------
+// =============================================================================
 // REQUÊTES HTTP ET SYSTÈME DE FICHIERS
-// ---------------------------------------------------------
+// =============================================================================
 
 func getJoplinFolderID(folderName string) string {
 	url := fmt.Sprintf("http://localhost:%s/folders?token=%s", JoplinPort, JoplinToken)
 	client := http.Client{Timeout: 3 * time.Second}
+
 	resp, err := client.Get(url)
 	if err != nil || resp.StatusCode != 200 {
 		return ""
@@ -353,6 +365,7 @@ func getJoplinFolderID(folderName string) string {
 
 	var data JoplinFoldersResponse
 	json.NewDecoder(resp.Body).Decode(&data)
+
 	for _, folder := range data.Items {
 		if folder.Title == folderName {
 			return folder.ID
@@ -364,8 +377,8 @@ func getJoplinFolderID(folderName string) string {
 func sendToJoplin(folderID, title, body string) bool {
 	note := JoplinNote{ParentID: folderID, Title: title, Body: body}
 	jsonData, _ := json.Marshal(note)
-	url := fmt.Sprintf("http://localhost:%s/notes?token=%s", JoplinPort, JoplinToken)
 
+	url := fmt.Sprintf("http://localhost:%s/notes?token=%s", JoplinPort, JoplinToken)
 	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	req.Header.Set("Content-Type", "application/json")
 
@@ -375,8 +388,10 @@ func sendToJoplin(folderID, title, body string) bool {
 	if err != nil || resp.StatusCode != 200 {
 		return false
 	}
+
 	io.Copy(io.Discard, resp.Body)
 	defer resp.Body.Close()
+
 	return true
 }
 
@@ -385,6 +400,7 @@ func findExecutable(homeDir string) string {
 		filepath.Join(homeDir, "Documents", "whisper.cpp", "build", "bin", "whisper-cli.exe"),
 		filepath.Join(homeDir, "Documents", "whisper.cpp", "build", "bin", "Release", "whisper-cli.exe"),
 	}
+
 	for _, p := range paths {
 		if _, err := os.Stat(p); err == nil {
 			return p
@@ -410,5 +426,6 @@ func moveToQuarantine(src, quarantineDir string) {
 	ts := time.Now().Format("20060102_150405")
 	ext := filepath.Ext(filename)
 	safeName := fmt.Sprintf("%s_%s%s", strings.TrimSuffix(filename, ext), ts, ext)
+
 	os.Rename(src, filepath.Join(quarantineDir, safeName))
 }
